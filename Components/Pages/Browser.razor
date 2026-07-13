@@ -1,0 +1,459 @@
+@page "/browser"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject BrowserSnapshotService Snapshots
+@inject ScpiPointService Points
+@inject ScpiValueConverter Converter
+@inject ScpiDirectWriteService DirectWrite
+@inject CommandDispatcherService Commands
+@inject ScreenAlertService Alerts
+
+<PageTitle>Browser</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Browser</h1>
+        <p class="page-kicker">Local SCPI samples and authoritative Redis point state are shown separately.</p>
+    </div>
+    <button class="btn btn-outline-primary" type="button" disabled="@loading" @onclick="ManualRefreshAsync">Refresh</button>
+</div>
+
+<section class="surface">
+    <div class="form-grid">
+        <div class="form-group">
+            <label class="form-label" for="browser-filter">Filter</label>
+            <input id="browser-filter" class="form-control" value="@filter" @oninput="FilterChanged" placeholder="Endpoint, point, SourcePath, or Redis key" />
+        </div>
+        <div class="form-group">
+            <div class="form-label">Snapshot freshness</div>
+            <div class="check-row">
+                @if (snapshot is null)
+                {
+                    <span class="status-badge warning">Loading</span>
+                }
+                else
+                {
+                    <span class="@StatusBadgeClass(snapshot.Mode.ToString())">@snapshot.Mode</span>
+                    <span class="muted-metadata">@snapshot.CapturedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</span>
+                }
+            </div>
+        </div>
+    </div>
+</section>
+
+@if (snapshot is not null && !string.IsNullOrWhiteSpace(loadError))
+{
+    <div class="error-state" role="alert">
+        @loadError The previous snapshot remains visible.
+        <div style="margin-top:10px"><button class="btn btn-outline-primary" type="button" @onclick="ManualRefreshAsync" disabled="@loading">Retry</button></div>
+    </div>
+}
+
+@if (snapshot?.Truncated == true)
+{
+    <div class="error-state" role="status">Showing the first 1,000 configured SCPI points. Additional points are omitted from this snapshot.</div>
+}
+
+@if (loading && snapshot is null)
+{
+    <div class="loading-state" role="status">Reading SCPI cache, Redis state, and ownership…</div>
+}
+else if (!string.IsNullOrWhiteSpace(loadError) && snapshot is null)
+{
+    <div class="error-state" role="alert">
+        @loadError
+        <div style="margin-top:10px"><button class="btn btn-outline-primary" type="button" @onclick="ManualRefreshAsync">Retry</button></div>
+    </div>
+}
+else if (VisiblePoints.Count == 0)
+{
+    <div class="empty-state">@(snapshot?.Points.Count == 0 ? "No SCPI point is configured." : "No point matches the current filter.")</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Endpoint / Point</th>
+                    <th>SCPI local sample</th>
+                    <th>Redis point state</th>
+                    <th>Ownership</th>
+                    <th>Write value</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            @foreach (var row in VisiblePoints)
+            {
+                <tr class="@(row.LocalValue?.Stale == true ? "stale-row" : "")">
+                    <td>
+                        <strong>@row.EndpointId / @row.DisplayName</strong>
+                        <div class="muted-metadata"><code>@row.SourcePath</code></div>
+                        <div class="muted-metadata">@row.Access · @row.DataType @(row.Unit ?? "")</div>
+                    </td>
+                    <td>
+                        @if (row.LocalValue is null)
+                        {
+                            <span class="status-badge neutral">No sample</span>
+                            <div class="muted-metadata">A mapped, owned poll has not completed.</div>
+                        }
+                        else
+                        {
+                            <div class="browser-value numeric">@FormatJson(row.LocalValue.Value, row.DataType)</div>
+                            <span class="@StatusBadgeClass(row.LocalValue.Stale ? "stale" : row.LocalValue.Quality)">@(row.LocalValue.Stale ? "stale" : row.LocalValue.Quality)</span>
+                            <div class="muted-metadata">@row.LocalValue.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss") · @row.LocalValue.Operation</div>
+                            @if (!string.IsNullOrWhiteSpace(row.LocalValue.ErrorMessage))
+                            {
+                                <div class="muted-metadata">@row.LocalValue.ErrorCode: @row.LocalValue.ErrorMessage</div>
+                            }
+                            @if (row.LocalValue.Stale)
+                            {
+                                <div class="muted-metadata">@row.LocalValue.StaleReason</div>
+                            }
+                        }
+                    </td>
+                    <td>
+                        <div><code>@(row.RedisKey ?? "missing mapping")</code></div>
+                        @if (row.RedisState is not null)
+                        {
+                            <div class="browser-value numeric">@FormatJson(row.RedisState.Value, row.RedisState.Type)</div>
+                            <span class="@StatusBadgeClass(row.RedisState.Quality)">@row.RedisState.Quality</span>
+                            <div class="muted-metadata">version @row.RedisState.Version · @FormatTimestamp(row.RedisState.Timestamp)</div>
+                        }
+                        else if (!string.IsNullOrWhiteSpace(row.RedisStateError))
+                        {
+                            <div class="muted-metadata">@row.RedisStateError</div>
+                        }
+                        else
+                        {
+                            <span class="status-badge neutral">Unavailable</span>
+                        }
+                    </td>
+                    <td>
+                        <span class="@StatusBadgeClass(row.IsOwned ? "good" : row.OwnershipStatus)">@row.OwnershipStatus</span>
+                        <div class="muted-metadata">@(row.Owner ?? "-")</div>
+                    </td>
+                    <td>
+                        <input class="form-control" aria-label="Write value for @row.DisplayName"
+                               value="@GetWriteValue(row.SourcePath)" @oninput="args => SetWriteValue(row.SourcePath, args.Value?.ToString())"
+                               disabled="@(!CanWrite(row))" title="@WriteDisabledReason(row)" />
+                    </td>
+                    <td>
+                        <div class="actions">
+                            <button class="btn btn-sm btn-outline-primary" type="button" disabled="@(!CanWrite(row) || IsWriting(row.SourcePath))"
+                                    title="@WriteDisabledReason(row)" @onclick="() => WriteScpiAsync(row)">Write SCPI</button>
+                            <button class="btn btn-sm btn-primary" type="button" disabled="@(!CanWrite(row) || IsWriting(row.SourcePath))"
+                                    title="@WriteDisabledReason(row)" @onclick="() => WriteRedisAsync(row)">Write Redis</button>
+                        </div>
+                    </td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private readonly object refreshSync = new();
+    private readonly object operationSync = new();
+    private readonly Dictionary<string, string> writeValues = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> writing = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<Task> activeWrites = [];
+    private readonly CancellationTokenSource disposal = new();
+    private Task? refreshTask;
+    private BrowserSnapshot? snapshot;
+    private bool loading;
+    private bool refreshPending;
+    private bool manualRefreshPending;
+    private string? loadError;
+    private string? lastAlertedLoadError;
+    private string filter = "";
+
+    private IReadOnlyList<BrowserPointSnapshot> VisiblePoints => snapshot?.Points
+        .Where(row => string.IsNullOrWhiteSpace(filter)
+                      || row.EndpointId.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || row.PointId.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || row.DisplayName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || row.SourcePath.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                      || (row.RedisKey?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false))
+        .ToList() ?? [];
+
+    protected override async Task OnInitializedAsync()
+    {
+        Snapshots.SnapshotChanged += OnSnapshotChanged;
+        await RefreshAsync();
+    }
+
+    private void OnSnapshotChanged()
+    {
+        if (!disposal.IsCancellationRequested)
+        {
+            _ = InvokeAsync(() => RefreshAsync());
+        }
+    }
+
+    private Task ManualRefreshAsync() => RefreshAsync(manual: true);
+
+    private Task RefreshAsync(bool manual = false)
+    {
+        lock (refreshSync)
+        {
+            if (disposal.IsCancellationRequested)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (refreshTask is { IsCompleted: false })
+            {
+                refreshPending = true;
+                manualRefreshPending |= manual;
+                return refreshTask;
+            }
+
+            refreshPending = false;
+            manualRefreshPending = false;
+            refreshTask = RunRefreshLoopAsync(manual);
+            return refreshTask;
+        }
+    }
+
+    private async Task RunRefreshLoopAsync(bool manual)
+    {
+        var currentManual = manual;
+        while (!disposal.IsCancellationRequested)
+        {
+            loading = true;
+            try
+            {
+                snapshot = await Snapshots.GetSnapshotAsync(disposal.Token);
+                foreach (var point in snapshot.Points) writeValues.TryAdd(point.SourcePath, "");
+                loadError = null;
+                lastAlertedLoadError = null;
+            }
+            catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                loadError = $"Browser refresh failed: {ex.Message}";
+                if (currentManual || !string.Equals(loadError, lastAlertedLoadError, StringComparison.Ordinal))
+                {
+                    lastAlertedLoadError = loadError;
+                    await Alerts.ShowAsync(loadError, ScreenAlertSeverity.Error, "Browser refresh failed");
+                }
+            }
+            finally
+            {
+                loading = false;
+            }
+
+            lock (refreshSync)
+            {
+                if (!refreshPending || disposal.IsCancellationRequested)
+                {
+                    refreshTask = null;
+                    return;
+                }
+
+                refreshPending = false;
+                currentManual = manualRefreshPending;
+                manualRefreshPending = false;
+            }
+        }
+    }
+
+    private void FilterChanged(ChangeEventArgs args) => filter = args.Value?.ToString() ?? "";
+    private string GetWriteValue(string sourcePath) => writeValues.GetValueOrDefault(sourcePath) ?? "";
+    private void SetWriteValue(string sourcePath, string? value) => writeValues[sourcePath] = value ?? "";
+    private bool IsWriting(string sourcePath) => writing.Contains(sourcePath);
+
+    private Task WriteScpiAsync(BrowserPointSnapshot row) =>
+        RunTrackedWriteAsync(() => WriteScpiCoreAsync(row));
+
+    private async Task WriteScpiCoreAsync(BrowserPointSnapshot row)
+    {
+        if (!BeginWrite(row.SourcePath)) return;
+        try
+        {
+            var point = await Points.GetAsync(row.PointConfigId, disposal.Token)
+                ?? throw new InvalidOperationException("The selected SCPI point no longer exists.");
+            var input = Converter.ParseUserInput(point, GetWriteValue(row.SourcePath));
+            var result = await DirectWrite.WriteAsync(row.SourcePath, input, "RedisScpi Browser", disposal.Token);
+            disposal.Token.ThrowIfCancellationRequested();
+            await Alerts.ShowAsync(
+                result.Message,
+                result.Success ? ScreenAlertSeverity.Success : ScreenAlertSeverity.Error,
+                result.Success ? "Direct write completed" : result.ErrorCode);
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            await Alerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Direct write failed");
+        }
+        finally
+        {
+            EndWrite(row.SourcePath);
+        }
+    }
+
+    private Task WriteRedisAsync(BrowserPointSnapshot row) =>
+        RunTrackedWriteAsync(() => WriteRedisCoreAsync(row));
+
+    private async Task WriteRedisCoreAsync(BrowserPointSnapshot row)
+    {
+        if (!BeginWrite(row.SourcePath)) return;
+        try
+        {
+            var point = await Points.GetAsync(row.PointConfigId, disposal.Token)
+                ?? throw new InvalidOperationException("The selected SCPI point no longer exists.");
+            var input = Converter.ParseUserInput(point, GetWriteValue(row.SourcePath));
+            var published = await Commands.PublishHmiWriteAsync(
+                row.RedisKey!, input, row.RedisState?.Version, "RedisScpi Browser", disposal.Token);
+            disposal.Token.ThrowIfCancellationRequested();
+            await Alerts.ShowAsync(
+                $"Published command {published.CommandId}; the command result will appear in Log and runtime diagnostics.",
+                ScreenAlertSeverity.Info,
+                "Redis command published");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            await Alerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Redis write failed");
+        }
+        finally
+        {
+            EndWrite(row.SourcePath);
+        }
+    }
+
+    private bool BeginWrite(string sourcePath)
+    {
+        if (writing.Contains(sourcePath)) return false;
+        writing.Add(sourcePath);
+        return true;
+    }
+
+    private void EndWrite(string sourcePath)
+    {
+        writing.Remove(sourcePath);
+        if (!disposal.IsCancellationRequested)
+        {
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private Task RunTrackedWriteAsync(Func<Task> operation)
+    {
+        if (disposal.IsCancellationRequested)
+        {
+            return Task.CompletedTask;
+        }
+
+        var task = operation();
+        lock (operationSync)
+        {
+            activeWrites.Add(task);
+        }
+
+        return AwaitTrackedWriteAsync(task);
+    }
+
+    private async Task AwaitTrackedWriteAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        finally
+        {
+            lock (operationSync)
+            {
+                activeWrites.Remove(task);
+            }
+        }
+    }
+
+    private bool CanWrite(BrowserPointSnapshot row) =>
+        !loading && loadError is null && snapshot?.RedisOutputReady == true
+        && row.EndpointEnabled && row.PointEnabled && row.RedisKey is not null && row.IsOwned
+        && ScpiAccessModes.Readwrite.Equals(row.Access, StringComparison.OrdinalIgnoreCase);
+
+    private string WriteDisabledReason(BrowserPointSnapshot row)
+    {
+        if (loading) return "Browser state is refreshing.";
+        if (loadError is not null) return "Refresh the Browser state before writing.";
+        if (snapshot?.RedisOutputReady != true) return "Redis output startup requirements are not ready.";
+        if (!row.EndpointEnabled) return "Endpoint is disabled.";
+        if (!row.PointEnabled) return "Point is disabled.";
+        if (row.RedisKey is null) return "Create a RedisMapping first.";
+        if (!row.IsOwned) return "This RedisScpi instance does not hold ownership.";
+        if (!ScpiAccessModes.Readwrite.Equals(row.Access, StringComparison.OrdinalIgnoreCase)) return "Point is readonly.";
+        return "Write a validated value.";
+    }
+
+    private static string FormatJson(JsonElement? value, string type)
+    {
+        if (value is null) return "—";
+        var element = value.Value;
+        if ((type.Equals("double", StringComparison.OrdinalIgnoreCase) || type.Equals(ScpiDataTypes.Number, StringComparison.OrdinalIgnoreCase))
+            && element.ValueKind == JsonValueKind.Number && element.TryGetDouble(out var number))
+        {
+            return number.ToString("N2", CultureInfo.InvariantCulture);
+        }
+        return element.ValueKind == JsonValueKind.String ? element.GetString() ?? "" : element.GetRawText();
+    }
+
+    private static string FormatTimestamp(long milliseconds)
+    {
+        try { return DateTimeOffset.FromUnixTimeMilliseconds(milliseconds).LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss"); }
+        catch { return milliseconds.ToString(CultureInfo.InvariantCulture); }
+    }
+
+    private static string StatusBadgeClass(string? status) => status?.ToLowerInvariant() switch
+    {
+        "normal" or "good" or "ok" => "status-badge success",
+        "starting" or "pending" or "unset" => "status-badge warning",
+        "degraded" or "bad" or "failed" or "error" or "stale" or "owned_by_other" or "missing_mapping" => "status-badge danger",
+        _ => "status-badge neutral"
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        Snapshots.SnapshotChanged -= OnSnapshotChanged;
+        disposal.Cancel();
+        Task? pendingRefresh;
+        Task[] pendingWrites;
+        lock (refreshSync)
+        {
+            pendingRefresh = refreshTask;
+        }
+        lock (operationSync)
+        {
+            pendingWrites = activeWrites.ToArray();
+        }
+
+        try
+        {
+            if (pendingRefresh is not null)
+            {
+                await pendingRefresh;
+            }
+            await Task.WhenAll(pendingWrites);
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch
+        {
+            // Operations surface their own errors before disposal; teardown must remain best-effort.
+        }
+
+        disposal.Dispose();
+    }
+}

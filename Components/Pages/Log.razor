@@ -1,0 +1,146 @@
+@page "/log"
+@rendermode InteractiveServer
+@inject LogService Logs
+@inject ScreenAlertService Alerts
+
+<PageTitle>Log</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Log</h1>
+        <p class="page-kicker">Recent SCPI operations and RedisScpi runtime diagnostics.</p>
+    </div>
+    <button class="btn btn-outline-primary" type="button" disabled="@loading" @onclick="LoadAsync">Refresh</button>
+</div>
+
+@if (loading && scpiEntries.Count == 0 && systemEntries.Count == 0)
+{
+    <div class="loading-state" role="status">Loading recent log entries…</div>
+}
+else if (!string.IsNullOrWhiteSpace(error))
+{
+    <div class="error-state" role="alert">
+        @error
+        <div class="toolbar-actions" style="justify-content:center; margin-top:10px">
+            <button class="btn btn-outline-primary" type="button" @onclick="LoadAsync">Retry</button>
+        </div>
+    </div>
+}
+else
+{
+    <div class="toolbar">
+        <div>
+            <h2 class="toolbar-title">SCPI operations</h2>
+            <div class="muted-metadata">Latest query, write, verification, Error Queue, and transport results.</div>
+        </div>
+        <div class="muted-metadata">Updated @updatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</div>
+    </div>
+
+    @if (scpiEntries.Count == 0)
+    {
+        <div class="empty-state">No SCPI operation has been recorded yet.</div>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Time</th><th>Endpoint / Point</th><th>Operation</th><th>Result</th><th>Details</th><th class="numeric">Duration</th>
+                    </tr>
+                </thead>
+                <tbody>
+                @foreach (var entry in scpiEntries)
+                {
+                    <tr>
+                        <td class="numeric">@entry.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td>@(entry.EndpointId ?? "-") / @(entry.PointId ?? "-")</td>
+                        <td>@entry.Operation</td>
+                        <td><span class="@StatusBadgeClass(entry.Level)">@entry.Level</span> @(entry.ErrorCode ?? "")</td>
+                        <td>
+                            <div>@entry.Message</div>
+                            @if (!string.IsNullOrWhiteSpace(entry.CommandText)) { <div class="muted-metadata"><code>@entry.CommandText</code></div> }
+                            @if (!string.IsNullOrWhiteSpace(entry.ResponseText)) { <div class="muted-metadata">Response: <code>@entry.ResponseText</code></div> }
+                        </td>
+                        <td class="numeric">@(entry.DurationMs?.ToString("N0", CultureInfo.InvariantCulture) ?? "-") ms</td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+
+    <div class="toolbar">
+        <div>
+            <h2 class="toolbar-title">System diagnostics</h2>
+            <div class="muted-metadata">Startup, ownership, command, import, and Redis output events.</div>
+        </div>
+    </div>
+    @if (systemEntries.Count == 0)
+    {
+        <div class="empty-state">No system diagnostic has been recorded yet.</div>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table">
+                <thead><tr><th>Time</th><th>Category</th><th>Level</th><th>Message</th><th>Command</th></tr></thead>
+                <tbody>
+                @foreach (var entry in systemEntries)
+                {
+                    <tr>
+                        <td class="numeric">@entry.CreatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td>@entry.Category</td>
+                        <td><span class="@StatusBadgeClass(entry.Level)">@entry.Level</span></td>
+                        <td>@entry.Message</td>
+                        <td><code>@(entry.CommandId ?? "-")</code></td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+@code {
+    private IReadOnlyList<ScpiLogEntry> scpiEntries = [];
+    private IReadOnlyList<SystemLogEntry> systemEntries = [];
+    private bool loading;
+    private string? error;
+    private DateTimeOffset updatedAt;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        if (loading) return;
+        loading = true;
+        error = null;
+        try
+        {
+            var scpiTask = Logs.GetScpiAsync(250);
+            var systemTask = Logs.GetSystemAsync(250);
+            await Task.WhenAll(scpiTask, systemTask);
+            scpiEntries = await scpiTask;
+            systemEntries = await systemTask;
+            updatedAt = DateTimeOffset.UtcNow;
+        }
+        catch (Exception ex)
+        {
+            error = $"Log refresh failed: {ex.Message}";
+            await Alerts.ShowAsync(error, ScreenAlertSeverity.Error, "Log refresh failed");
+        }
+        finally
+        {
+            loading = false;
+        }
+    }
+
+    private static string StatusBadgeClass(string? level) => level?.ToLowerInvariant() switch
+    {
+        "info" or "success" => "status-badge success",
+        "warning" => "status-badge warning",
+        "error" or "critical" => "status-badge danger",
+        _ => "status-badge neutral"
+    };
+}

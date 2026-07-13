@@ -1,0 +1,12 @@
+bin/
+obj/
+*.db
+*.db-shm
+*.db-wal
+run.*.log
+*.user
+*.suo
+.git/
+.vs/
+.vscode/
+data-protection-keys/

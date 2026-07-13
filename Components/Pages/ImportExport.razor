@@ -1,0 +1,256 @@
+@page "/import-export"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject CsvConfigService Csv
+@inject ZipConfigService Zip
+@inject IOptions<ImportExportOptions> Limits
+@inject IJSRuntime JS
+@inject ScreenAlertService Alerts
+
+<PageTitle>Import / Export</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Import / Export</h1>
+        <p class="page-kicker">Merge/upsert SCPI configuration using dependency-aware CSV or ZIP bundles.</p>
+    </div>
+</div>
+
+<div class="split-grid">
+    <section class="surface">
+        <div class="surface-header">
+            <div>
+                <h2>Export configuration</h2>
+                <div class="muted-metadata">Canonical order: endpoint → point → enum option → mapping.</div>
+            </div>
+        </div>
+        <p>The exported CSV is safe to re-import. ZIP includes the canonical CSV and a versioned manifest.</p>
+        <div class="toolbar-actions">
+            <button class="btn btn-outline-primary" type="button" disabled="@busy" @onclick="ExportCsvAsync">Export CSV</button>
+            <button class="btn btn-primary" type="button" disabled="@busy" @onclick="ExportZipAsync">Export ZIP</button>
+        </div>
+    </section>
+
+    <section class="surface">
+        <div class="surface-header">
+            <div>
+                <h2>Import configuration</h2>
+                <div class="muted-metadata">Endpoints, points, and mappings merge/upsert. Enum rows replace the supplied point's enum option group.</div>
+            </div>
+        </div>
+        <div class="file-drop">
+            <label class="form-label" for="config-import">CSV or ZIP file</label>
+            <InputFile id="config-import" OnChange="SelectFile" accept=".csv,.zip,text/csv,application/zip" disabled="@busy" />
+            @if (selectedFile is not null)
+            {
+                <div class="form-text">@selectedFile.Name · @FormatBytes(selectedFile.Size)</div>
+            }
+        </div>
+        <div class="toolbar-actions" style="margin-top:12px">
+            <button class="btn btn-primary" type="button" disabled="@(busy || selectedFile is null)" @onclick="ImportAsync">Import</button>
+        </div>
+        <p class="form-text">Rows are parsed first, validated with their original line number, then committed in one transaction. Records outside supplied enum groups remain unchanged, and any error leaves persisted configuration unchanged.</p>
+    </section>
+</div>
+
+@if (busy)
+{
+    <div class="loading-state" role="status">@busyMessage</div>
+}
+else if (lastResult is not null)
+{
+    <section class="surface" aria-live="polite">
+        <h2>Last import result</h2>
+        @if (!string.IsNullOrWhiteSpace(lastResultFileName))
+        {
+            <div class="muted-metadata">File: @lastResultFileName</div>
+        }
+        @if (lastResult.Errors.Count == 0)
+        {
+            <p><span class="status-badge success">Completed</span> Imported or updated @lastResult.ImportedRows row(s).</p>
+        }
+        else
+        {
+            <p><span class="status-badge danger">Rejected</span> No rows were saved. Review the errors below.</p>
+            <ol class="result-list">
+            @foreach (var item in lastResult.Errors.Take(8))
+            {
+                <li>@item</li>
+            }
+            </ol>
+            @if (lastResult.Errors.Count > 8)
+            {
+                <div class="muted-metadata">Plus @(lastResult.Errors.Count - 8) additional error(s).</div>
+            }
+        }
+    </section>
+}
+
+@code {
+    private readonly CancellationTokenSource disposal = new();
+    private IBrowserFile? selectedFile;
+    private CsvImportResult? lastResult;
+    private string? lastResultFileName;
+    private bool busy;
+    private string busyMessage = "Working…";
+    private IJSObjectReference? module;
+    private Task? activeOperation;
+
+    private void SelectFile(InputFileChangeEventArgs args)
+    {
+        if (busy) return;
+        selectedFile = args.File;
+        lastResult = null;
+        lastResultFileName = null;
+    }
+
+    private Task ExportCsvAsync() => TrackOperationAsync(() => ExportAsync("redis-scpi-config.csv", Csv.ExportAsync));
+    private Task ExportZipAsync() => TrackOperationAsync(() => ExportAsync("redis-scpi-config.zip", Zip.ExportAsync));
+
+    private async Task ExportAsync(string fileName, Func<CancellationToken, Task<Stream>> exporter)
+    {
+        if (busy) return;
+        busy = true;
+        busyMessage = $"Preparing {fileName}…";
+        try
+        {
+            await using var stream = await exporter(disposal.Token);
+            module ??= await JS.InvokeAsync<IJSObjectReference>("import", disposal.Token, "./js/importExportInterop.js");
+            using var reference = new DotNetStreamReference(stream);
+            await module.InvokeVoidAsync("downloadFileFromStream", disposal.Token, fileName, reference);
+            disposal.Token.ThrowIfCancellationRequested();
+            await Alerts.ShowAsync($"Exported {fileName}.", ScreenAlertSeverity.Success, "Export completed");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            await Alerts.ShowAsync($"Export failed: {ex.Message}", ScreenAlertSeverity.Error, "Export failed");
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private Task ImportAsync() => TrackOperationAsync(ImportCoreAsync);
+
+    private async Task ImportCoreAsync()
+    {
+        if (busy || selectedFile is null) return;
+        var file = selectedFile;
+        busy = true;
+        busyMessage = $"Validating and importing {file.Name}…";
+        lastResult = null;
+        lastResultFileName = file.Name;
+        try
+        {
+            var zip = file.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+            var maximum = zip ? Limits.Value.ZipFileLimitBytes : Limits.Value.SingleCsvLimitBytes;
+            if (file.Size > maximum)
+            {
+                throw new InvalidOperationException($"The selected file exceeds the {FormatBytes(maximum)} limit.");
+            }
+
+            await using var stream = file.OpenReadStream(maximum, disposal.Token);
+            lastResult = zip
+                ? await Zip.ImportAsync(stream, disposal.Token)
+                : await Csv.ImportAsync(stream, disposal.Token);
+            disposal.Token.ThrowIfCancellationRequested();
+            if (lastResult.Errors.Count == 0)
+            {
+                await Alerts.ShowAsync(
+                    $"Imported or updated {lastResult.ImportedRows} configuration row(s).",
+                    ScreenAlertSeverity.Success,
+                    "Import completed");
+            }
+            else
+            {
+                await Alerts.ShowAsync(
+                    $"Import rejected with {lastResult.Errors.Count} error(s); no configuration was saved.",
+                    ScreenAlertSeverity.Error,
+                    "Import rejected");
+            }
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            lastResult = new CsvImportResult(0, [ex.Message]);
+            await Alerts.ShowAsync($"Import failed: {ex.Message}", ScreenAlertSeverity.Error, "Import failed");
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private Task TrackOperationAsync(Func<Task> operation)
+    {
+        if (disposal.IsCancellationRequested)
+        {
+            return Task.CompletedTask;
+        }
+        if (activeOperation is { IsCompleted: false })
+        {
+            return activeOperation;
+        }
+
+        var task = operation();
+        activeOperation = task;
+        return AwaitTrackedOperationAsync(task);
+    }
+
+    private async Task AwaitTrackedOperationAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        finally
+        {
+            if (ReferenceEquals(activeOperation, task))
+            {
+                activeOperation = null;
+            }
+        }
+    }
+
+    private static string FormatBytes(long bytes) => bytes >= 1024 * 1024
+        ? $"{bytes / 1024d / 1024d:N1} MiB"
+        : $"{bytes / 1024d:N1} KiB";
+
+    public async ValueTask DisposeAsync()
+    {
+        disposal.Cancel();
+        var operation = activeOperation;
+        if (operation is not null)
+        {
+            try
+            {
+                await operation;
+            }
+            catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+            {
+            }
+            catch
+            {
+                // The operation reports its own failure while the circuit is active.
+            }
+        }
+
+        if (module is not null)
+        {
+            try
+            {
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+        }
+        disposal.Dispose();
+    }
+}

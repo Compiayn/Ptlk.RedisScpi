@@ -1,0 +1,1089 @@
+@page "/endpoint-link"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject ScpiEndpointService Endpoints
+@inject ScpiPointService Points
+@inject ScpiSourcePathService SourcePaths
+@inject Microsoft.Extensions.Options.IOptions<RedisScpiOptions> RedisScpiSettings
+@inject Microsoft.Extensions.Options.IOptions<ScpiRuntimeOptions> ScpiSettings
+@inject ScreenAlertService ScreenAlerts
+
+<div class="page-header">
+    <div>
+        <h1>EndpointLink</h1>
+        <p class="page-kicker">Manage SCPI TCP endpoints, scalar points, templates, and enum options.</p>
+    </div>
+    <div class="toolbar-actions">
+        <button class="btn btn-outline-primary" type="button" @onclick="LoadAsync" disabled="@isLoading">Refresh</button>
+        <button class="btn btn-primary" type="button" @onclick="() => OpenEndpointDialog()">Add Endpoint</button>
+    </div>
+</div>
+
+<section class="surface">
+    <div class="surface-header">
+        <div>
+            <h2 class="toolbar-title">Endpoints</h2>
+            <div class="muted-metadata">Select an endpoint to inspect and edit its points.</div>
+        </div>
+    </div>
+
+    @if (hasLoaded && !string.IsNullOrWhiteSpace(loadError))
+    {
+        <div class="error-state" role="alert">
+            @loadError
+            <button class="btn btn-sm btn-outline-primary" type="button" @onclick="LoadAsync" disabled="@isLoading">Retry</button>
+        </div>
+    }
+
+    @if (isLoading && !hasLoaded)
+    {
+        <div class="empty-state">Loading SCPI endpoints...</div>
+    }
+    else if (!hasLoaded && !string.IsNullOrWhiteSpace(loadError))
+    {
+        <div class="error-state" role="alert">
+            @loadError
+            <button class="btn btn-sm btn-outline-primary" type="button" @onclick="LoadAsync" disabled="@isLoading">Retry</button>
+        </div>
+    }
+    else if (endpoints.Count == 0)
+    {
+        <div class="empty-state">No SCPI endpoints are configured.</div>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th>Endpoint</th>
+                        <th>TCP address</th>
+                        <th>Error check</th>
+                        <th>Polling</th>
+                        <th>Status</th>
+                        <th>Points</th>
+                        <th class="actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                @foreach (var endpoint in endpoints)
+                {
+                    <tr @key="endpoint.Id" class="@(selectedEndpointId == endpoint.Id ? "selected-row" : null)">
+                        <td>
+                            <div>@endpoint.DisplayName</div>
+                            <small><code>@endpoint.EndpointId</code></small>
+                        </td>
+                        <td><code>@($"{endpoint.TcpHost}:{endpoint.TcpPort}")</code></td>
+                        <td>@endpoint.ErrorCheckMode</td>
+                        <td class="numeric">@endpoint.PollingIntervalMs ms</td>
+                        <td><span class="@StatusBadgeClass(endpoint.Enabled)">@(endpoint.Enabled ? "enabled" : "disabled")</span></td>
+                        <td class="numeric">@endpoint.Points.Count</td>
+                        <td class="actions">
+                            <button class="btn btn-sm btn-outline-primary" type="button" @onclick="() => SelectEndpoint(endpoint.Id)">Points</button>
+                            <button class="btn btn-sm btn-outline-secondary" type="button" @onclick="() => OpenEndpointDialog(endpoint)">Edit</button>
+                            <button class="btn btn-sm btn-outline-danger" type="button" @onclick="() => ConfirmDeleteEndpoint(endpoint)">Delete</button>
+                        </td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+</section>
+
+<section class="surface">
+    <div class="surface-header">
+        <div>
+            <h2 class="toolbar-title">Points</h2>
+            @if (SelectedEndpoint is null)
+            {
+                <div class="muted-metadata">Select an endpoint to manage its points.</div>
+            }
+            else
+            {
+                <div class="muted-metadata">@SelectedEndpoint.DisplayName · <code>@SelectedEndpoint.EndpointId</code></div>
+            }
+        </div>
+        <button class="btn btn-primary" type="button" disabled="@(SelectedEndpoint is null)" @onclick="() => OpenPointDialog()">Add Point</button>
+    </div>
+
+    @if (SelectedEndpoint is null)
+    {
+        <div class="empty-state">No endpoint is selected.</div>
+    }
+    else if (SelectedPoints.Count == 0)
+    {
+        <div class="empty-state">This endpoint has no SCPI points.</div>
+    }
+    else
+    {
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th>Point</th>
+                        <th>SCPI name</th>
+                        <th>Type</th>
+                        <th>Access</th>
+                        <th>Mapping</th>
+                        <th>Polling</th>
+                        <th>Status</th>
+                        <th class="actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                @foreach (var point in SelectedPoints)
+                {
+                    <tr @key="point.Id">
+                        <td>
+                            <div>@DisplayPoint(point)</div>
+                            <small><code>@point.SourcePath</code></small>
+                        </td>
+                        <td><code>@point.Name</code></td>
+                        <td>@DisplayPointType(point)</td>
+                        <td>@point.Access</td>
+                        <td>
+                            @if (mappingKeys.TryGetValue(point.SourcePath, out var redisKey))
+                            {
+                                <span class="status-badge success">mapped</span>
+                                <div><small><code>@redisKey</code></small></div>
+                            }
+                            else
+                            {
+                                <span class="status-badge warning">unmapped</span>
+                            }
+                        </td>
+                        <td><span class="@StatusBadgeClass(point.PollingEnabled)">@(point.PollingEnabled ? "enabled" : "disabled")</span></td>
+                        <td><span class="@StatusBadgeClass(point.Enabled)">@(point.Enabled ? "enabled" : "disabled")</span></td>
+                        <td class="actions">
+                            <button class="btn btn-sm btn-outline-secondary" type="button" @onclick="() => OpenPointDialog(point)">Edit</button>
+                            <button class="btn btn-sm btn-outline-danger" type="button" @onclick="() => ConfirmDeletePoint(point)">Delete</button>
+                        </td>
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+    }
+</section>
+
+@if (lastLoaded is not null)
+{
+    <div class="muted-metadata">Last refreshed @lastLoaded.Value.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss").</div>
+}
+
+@if (endpointDialogOpen && endpointEditor is not null)
+{
+    <div class="dialog-backdrop" @onclick="CloseEndpointDialog">
+    <div class="dialog-panel wide" role="dialog" aria-modal="true" aria-labelledby="endpoint-dialog-title" @onclick:stopPropagation="true">
+        <div class="dialog-header">
+            <div>
+                <h2 id="endpoint-dialog-title" class="m-0">@(endpointEditor.Id > 0 ? "Edit Endpoint" : "Add Endpoint")</h2>
+                <div class="muted-metadata">TCP is the supported transport for the first implementation.</div>
+            </div>
+            <button class="dialog-close" type="button" aria-label="Close" @onclick="CloseEndpointDialog">×</button>
+        </div>
+        <fieldset class="dialog-body dialog-fieldset @(saving ? "interaction-disabled" : null)" disabled="@saving" aria-busy="@saving">
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">Endpoint ID</label>
+                    <input class="form-control" @bind="endpointEditor.EndpointId" placeholder="power-supply-01" />
+                    <div class="form-text">Stable token used in every point SourcePath.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Display name</label>
+                    <input class="form-control" @bind="endpointEditor.DisplayName" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Transport</label>
+                    <input class="form-control" value="tcp" readonly />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Converter ID</label>
+                    <input class="form-control" @bind="endpointEditor.ConverterId" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">TCP host</label>
+                    <input class="form-control" @bind="endpointEditor.TcpHost" placeholder="127.0.0.1" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">TCP port</label>
+                    <input class="form-control" type="number" min="1" max="65535" @bind="endpointEditor.TcpPort" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Timeout (ms)</label>
+                    <input class="form-control" type="number" min="1" @bind="endpointEditor.TimeoutMs" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Polling interval (ms)</label>
+                    <input class="form-control" type="number" min="100" @bind="endpointEditor.PollingIntervalMs" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Error Queue policy</label>
+                    <select class="form-select" @bind="endpointEditor.ErrorCheckMode">
+                        @foreach (var mode in ScpiErrorCheckModes.All)
+                        {
+                            <option value="@mode">@mode</option>
+                        }
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Error Queue query</label>
+                    <input class="form-control" @bind="endpointEditor.ErrorQueueQuery" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Command terminator</label>
+                    <input class="form-control" @bind="commandTerminatorText" placeholder="\n" />
+                    <div class="form-text">Use \n, \r, \t, or \\ escape sequences.</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Response terminator</label>
+                    <input class="form-control" @bind="responseTerminatorText" placeholder="\n" />
+                </div>
+                <div class="form-group full check-row">
+                    <label><input type="checkbox" @bind="endpointEditor.Enabled" /> Enabled</label>
+                </div>
+            </div>
+        </fieldset>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="CloseEndpointDialog" disabled="@saving">Cancel</button>
+            <button class="btn btn-primary" type="button" @onclick="SaveEndpointAsync" disabled="@saving">@(saving ? "Saving..." : "Save")</button>
+        </div>
+    </div>
+    </div>
+}
+
+@if (pointDialogOpen && pointEditor is not null && SelectedEndpoint is not null)
+{
+    <div class="dialog-backdrop" @onclick="ClosePointDialog">
+    <div class="dialog-panel wide" role="dialog" aria-modal="true" aria-labelledby="point-dialog-title" @onclick:stopPropagation="true">
+        <div class="dialog-header">
+            <div>
+                <h2 id="point-dialog-title" class="m-0">@(pointEditor.Id > 0 ? "Edit Point" : "Add Point")</h2>
+                <div class="muted-metadata">Endpoint <code>@SelectedEndpoint.EndpointId</code> · Source <code>@PointSourcePreview</code></div>
+            </div>
+            <button class="dialog-close" type="button" aria-label="Close" @onclick="ClosePointDialog">×</button>
+        </div>
+        <fieldset class="dialog-body dialog-fieldset @(saving ? "interaction-disabled" : null)" disabled="@saving" aria-busy="@saving">
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">Point ID</label>
+                    <input class="form-control" @bind="pointEditor.PointId" placeholder="output-voltage" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Display name</label>
+                    <input class="form-control" @bind="pointEditor.DisplayName" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">SCPI name</label>
+                    <input class="form-control" @bind="pointEditor.Name" placeholder="VOLTage" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Unit</label>
+                    <input class="form-control" @bind="pointEditor.Unit" placeholder="V" />
+                </div>
+
+                <div class="form-group full">
+                    <label class="form-label">Access</label>
+                    <div class="radio-row">
+                        @foreach (var access in ScpiAccessModes.All)
+                        {
+                            <label>
+                                <input type="radio" name="point-access" value="@access" checked="@(pointEditor.Access == access)" @onchange="() => ChangeAccess(access)" />
+                                @access
+                            </label>
+                        }
+                    </div>
+                </div>
+
+                <div class="form-group full">
+                    <label class="form-label">Data type</label>
+                    <div class="radio-row">
+                        @foreach (var dataType in ScpiDataTypes.All)
+                        {
+                            <label>
+                                <input type="radio" name="point-data-type" value="@dataType" checked="@(pointEditor.DataType == dataType)" @onchange="() => ChangeDataType(dataType)" />
+                                @dataType
+                            </label>
+                        }
+                    </div>
+                </div>
+
+                @if (pointEditor.DataType == ScpiDataTypes.Number)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Number type</label>
+                        <select class="form-select" @bind="pointEditor.NumberType">
+                            @foreach (var numberType in ScpiNumberTypes.All)
+                            {
+                                <option value="@numberType">@numberType</option>
+                            }
+                        </select>
+                    </div>
+                }
+                else if (pointEditor.DataType == ScpiDataTypes.String)
+                {
+                    <div class="form-group">
+                        <label class="form-label">String format</label>
+                        <select class="form-select" @bind="pointEditor.StringFormat">
+                            @foreach (var stringFormat in ScpiStringFormats.All)
+                            {
+                                <option value="@stringFormat">@stringFormat</option>
+                            }
+                        </select>
+                    </div>
+                }
+                else if (pointEditor.DataType == ScpiDataTypes.Enum)
+                {
+                    <div class="form-group">
+                        <label class="form-label">Redis enum format</label>
+                        <select class="form-select" @bind="pointEditor.EnumFormat">
+                            @foreach (var enumFormat in ScpiEnumFormats.All)
+                            {
+                                <option value="@enumFormat">@enumFormat</option>
+                            }
+                        </select>
+                    </div>
+                }
+
+                <div class="form-group full">
+                    <label class="form-label">Read template</label>
+                    <input class="form-control" @bind="pointEditor.ReadTemplate" placeholder="{name}?" />
+                    <div class="form-text">Read templates may use <code>@("{name}")</code>; <code>@("{value}")</code> is reserved for writes.</div>
+                </div>
+                <div class="form-group full">
+                    <label class="form-label">Write template</label>
+                    <input class="form-control" @bind="pointEditor.WriteTemplate" disabled="@(pointEditor.Access == ScpiAccessModes.Readonly)" placeholder="{name} {value}" />
+                    <div class="form-text">A readwrite point requires <code>@("{value}")</code>. Readonly points keep this field inactive.</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Point polling override (ms)</label>
+                    <input class="form-control" type="number" min="100" @bind="pointEditor.PollingIntervalMs" placeholder="Endpoint default" />
+                </div>
+                <div class="form-group check-row">
+                    <label><input type="checkbox" @bind="pointEditor.InitialRead" /> Initial read</label>
+                    <label><input type="checkbox" @bind="pointEditor.Enabled" /> Enabled</label>
+                    <label><input type="checkbox" @bind="pointEditor.PollingEnabled" /> Polling enabled</label>
+                </div>
+            </div>
+
+            @if (pointEditor.DataType == ScpiDataTypes.Enum)
+            {
+                <div class="dialog-section">
+                    <div class="surface-header">
+                        <div>
+                            <h3 class="toolbar-title">Enum options</h3>
+                            <div class="muted-metadata">Value is sent to the instrument; code is used when Redis enum format is code.</div>
+                        </div>
+                        <button class="btn btn-sm btn-primary" type="button" @onclick="() => OpenEnumDialog()">Add Option</button>
+                    </div>
+
+                    @if (pointEditor.EnumOptions.Count == 0)
+                    {
+                        <div class="empty-state">Add at least one enum option before saving this point.</div>
+                    }
+                    else
+                    {
+                        <div class="table-responsive">
+                            <table class="table table-sm align-middle">
+                                <thead>
+                                    <tr>
+                                        <th>Display name</th>
+                                        <th>SCPI value</th>
+                                        <th>Redis code</th>
+                                        <th>Order</th>
+                                        <th class="actions">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                @for (var index = 0; index < pointEditor.EnumOptions.Count; index++)
+                                {
+                                    var optionIndex = index;
+                                    var option = pointEditor.EnumOptions[optionIndex];
+                                    <tr @key="EnumOptionKey(option, optionIndex)">
+                                        <td>@option.DisplayName</td>
+                                        <td><code>@option.Value</code></td>
+                                        <td class="numeric">@option.Code</td>
+                                        <td class="numeric">@option.SortOrder</td>
+                                        <td class="actions">
+                                            <button class="btn btn-sm btn-outline-secondary" type="button" @onclick="() => OpenEnumDialog(optionIndex)">Edit</button>
+                                            <button class="btn btn-sm btn-outline-danger" type="button" @onclick="() => ConfirmRemoveEnumOption(optionIndex)">Remove</button>
+                                        </td>
+                                    </tr>
+                                }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                </div>
+            }
+
+            @if ((pointEditor.Enabled || pointEditor.PollingEnabled) && !mappingKeys.ContainsKey(pointEditor.SourcePath))
+            {
+                <div class="alert alert-warning mt-3">An enabled or polling-enabled point requires an existing RedisMapping. Save it disabled first, create the mapping, then enable it.</div>
+            }
+        </fieldset>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="ClosePointDialog" disabled="@saving">Cancel</button>
+            <button class="btn btn-primary" type="button" @onclick="SavePointAsync" disabled="@saving">@(saving ? "Saving..." : "Save")</button>
+        </div>
+    </div>
+    </div>
+}
+
+@if (enumDialogOpen && enumEditor is not null)
+{
+    <div class="dialog-backdrop" @onclick="CloseEnumDialog">
+    <div class="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="enum-dialog-title" @onclick:stopPropagation="true">
+        <div class="dialog-header">
+            <h2 id="enum-dialog-title" class="m-0">@(enumEditIndex is null ? "Add Enum Option" : "Edit Enum Option")</h2>
+            <button class="dialog-close" type="button" aria-label="Close" @onclick="CloseEnumDialog">×</button>
+        </div>
+        <div class="dialog-body">
+            <div class="form-grid">
+                <div class="form-group full">
+                    <label class="form-label">Display name</label>
+                    <input class="form-control" @bind="enumEditor.DisplayName" />
+                </div>
+                <div class="form-group full">
+                    <label class="form-label">SCPI value</label>
+                    <input class="form-control" @bind="enumEditor.Value" placeholder="ON" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Redis code</label>
+                    <input class="form-control" type="number" @bind="enumEditor.Code" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Sort order</label>
+                    <input class="form-control" type="number" @bind="enumEditor.SortOrder" />
+                </div>
+            </div>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="CloseEnumDialog">Cancel</button>
+            <button class="btn btn-primary" type="button" @onclick="ApplyEnumOptionAsync">Apply</button>
+        </div>
+    </div>
+    </div>
+}
+
+@if (deleteEndpoint is not null)
+{
+    <div class="dialog-backdrop" @onclick="DismissDelete">
+    <div class="dialog-panel" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+        <div class="dialog-header"><h2 class="m-0">Delete Endpoint</h2></div>
+        <div class="dialog-body">Delete <strong>@deleteEndpoint.DisplayName</strong>, its points, enum options, and associated mappings?</div>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="DismissDelete" disabled="@saving">Cancel</button>
+            <button class="btn btn-danger" type="button" @onclick="DeleteEndpointAsync" disabled="@saving">Delete</button>
+        </div>
+    </div>
+    </div>
+}
+
+@if (deletePoint is not null)
+{
+    <div class="dialog-backdrop" @onclick="DismissDelete">
+    <div class="dialog-panel" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+        <div class="dialog-header"><h2 class="m-0">Delete Point</h2></div>
+        <div class="dialog-body">Delete <strong>@DisplayPoint(deletePoint)</strong>, its enum options, and associated mapping?</div>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="DismissDelete" disabled="@saving">Cancel</button>
+            <button class="btn btn-danger" type="button" @onclick="DeletePointAsync" disabled="@saving">Delete</button>
+        </div>
+    </div>
+    </div>
+}
+
+@if (removeEnumIndex is not null && pointEditor is not null)
+{
+    <div class="dialog-backdrop" @onclick="CancelRemoveEnumOption">
+    <div class="dialog-panel" role="dialog" aria-modal="true" @onclick:stopPropagation="true">
+        <div class="dialog-header"><h2 class="m-0">Remove Enum Option</h2></div>
+        <div class="dialog-body">Remove <strong>@pointEditor.EnumOptions[removeEnumIndex.Value].DisplayName</strong> from this point draft?</div>
+        <div class="dialog-footer">
+            <button class="btn btn-outline-secondary" type="button" @onclick="CancelRemoveEnumOption">Cancel</button>
+            <button class="btn btn-danger" type="button" @onclick="RemoveEnumOption">Remove</button>
+        </div>
+    </div>
+    </div>
+}
+
+@code {
+    private readonly CancellationTokenSource disposal = new();
+    private List<ScpiEndpointConfig> endpoints = [];
+    private IReadOnlyDictionary<string, string> mappingKeys = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private int? selectedEndpointId;
+    private ScpiEndpointConfig? endpointEditor;
+    private ScpiPointConfig? pointEditor;
+    private ScpiEnumOption? enumEditor;
+    private ScpiEndpointConfig? deleteEndpoint;
+    private ScpiPointConfig? deletePoint;
+    private int? enumEditIndex;
+    private int? removeEnumIndex;
+    private string? preservedWriteTemplate;
+    private string commandTerminatorText = "\\n";
+    private string responseTerminatorText = "\\n";
+    private bool endpointDialogOpen;
+    private bool pointDialogOpen;
+    private bool enumDialogOpen;
+    private bool isLoading;
+    private bool hasLoaded;
+    private bool saving;
+    private DateTimeOffset? lastLoaded;
+    private string? loadError;
+
+    private ScpiEndpointConfig? SelectedEndpoint =>
+        selectedEndpointId is null ? null : endpoints.FirstOrDefault(endpoint => endpoint.Id == selectedEndpointId.Value);
+
+    private List<ScpiPointConfig> SelectedPoints =>
+        SelectedEndpoint?.Points.OrderBy(point => point.PointId, StringComparer.OrdinalIgnoreCase).ToList() ?? [];
+
+    private string PointSourcePreview
+    {
+        get
+        {
+            if (pointEditor is null || SelectedEndpoint is null)
+            {
+                return "scpi:<endpoint>/<point>";
+            }
+
+            try
+            {
+                return SourcePaths.BuildPointSourcePath(SelectedEndpoint.EndpointId, pointEditor.PointId);
+            }
+            catch
+            {
+                return $"scpi:{SelectedEndpoint.EndpointId}/<point>";
+            }
+        }
+    }
+
+    protected override async Task OnInitializedAsync() => await LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        if (isLoading || disposal.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            isLoading = true;
+            loadError = null;
+            var loadedEndpoints = await Endpoints.ListAsync(disposal.Token);
+            var loadedMappings = await Points.ListMappingKeysAsync(disposal.Token);
+            endpoints = loadedEndpoints;
+            mappingKeys = loadedMappings;
+            if (selectedEndpointId is null || endpoints.All(endpoint => endpoint.Id != selectedEndpointId.Value))
+            {
+                selectedEndpointId = endpoints.FirstOrDefault()?.Id;
+            }
+            hasLoaded = true;
+            lastLoaded = DateTimeOffset.Now;
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            loadError = $"Endpoint refresh failed: {ex.Message}";
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Endpoint refresh failed");
+        }
+        finally
+        {
+            isLoading = false;
+        }
+    }
+
+    private void SelectEndpoint(int id) => selectedEndpointId = id;
+
+    private void OpenEndpointDialog(ScpiEndpointConfig? endpoint = null)
+    {
+        endpointEditor = endpoint is null ? NewEndpoint() : CloneEndpoint(endpoint);
+        commandTerminatorText = EscapeTerminator(endpointEditor.CommandTerminator);
+        responseTerminatorText = EscapeTerminator(endpointEditor.ResponseTerminator);
+        endpointDialogOpen = true;
+    }
+
+    private void CloseEndpointDialog()
+    {
+        if (saving)
+        {
+            return;
+        }
+        endpointDialogOpen = false;
+        endpointEditor = null;
+    }
+
+    private async Task SaveEndpointAsync()
+    {
+        if (saving || endpointEditor is null)
+        {
+            return;
+        }
+
+        try
+        {
+            saving = true;
+            endpointEditor.CommandTerminator = UnescapeTerminator(commandTerminatorText);
+            endpointEditor.ResponseTerminator = UnescapeTerminator(responseTerminatorText);
+            var saved = await Endpoints.CreateOrUpdateAsync(endpointEditor, disposal.Token);
+            selectedEndpointId = saved.Id;
+            endpointDialogOpen = false;
+            endpointEditor = null;
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync("SCPI endpoint saved.", ScreenAlertSeverity.Success, "EndpointLink");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (ScpiConfigurationConcurrencyException ex)
+        {
+            endpointDialogOpen = false;
+            endpointEditor = null;
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Warning, "Stale endpoint edit");
+        }
+        catch (Exception ex)
+        {
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Endpoint save failed");
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    private void OpenPointDialog(ScpiPointConfig? point = null)
+    {
+        if (SelectedEndpoint is null)
+        {
+            return;
+        }
+
+        pointEditor = point is null ? NewPoint(SelectedEndpoint.Id) : ClonePoint(point);
+        preservedWriteTemplate = pointEditor.WriteTemplate;
+        _ = PointSourcePreview;
+        pointDialogOpen = true;
+    }
+
+    private void ClosePointDialog()
+    {
+        if (saving || enumDialogOpen)
+        {
+            return;
+        }
+        pointDialogOpen = false;
+        pointEditor = null;
+        preservedWriteTemplate = null;
+        removeEnumIndex = null;
+    }
+
+    private async Task SavePointAsync()
+    {
+        if (saving || pointEditor is null)
+        {
+            return;
+        }
+
+        try
+        {
+            saving = true;
+            _ = PointSourcePreview;
+            await Points.CreateOrUpdateAsync(pointEditor, disposal.Token);
+            pointDialogOpen = false;
+            pointEditor = null;
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync("SCPI point saved.", ScreenAlertSeverity.Success, "EndpointLink");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (ScpiConfigurationConcurrencyException ex)
+        {
+            pointDialogOpen = false;
+            pointEditor = null;
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Warning, "Stale point edit");
+        }
+        catch (Exception ex)
+        {
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Point save failed");
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    private void ChangeAccess(string access)
+    {
+        if (pointEditor is null || pointEditor.Access == access)
+        {
+            return;
+        }
+
+        if (access == ScpiAccessModes.Readonly)
+        {
+            preservedWriteTemplate = pointEditor.WriteTemplate;
+            pointEditor.WriteTemplate = null;
+        }
+        else
+        {
+            pointEditor.WriteTemplate = string.IsNullOrWhiteSpace(preservedWriteTemplate)
+                ? "{name} {value}"
+                : preservedWriteTemplate;
+        }
+        pointEditor.Access = access;
+    }
+
+    private void ChangeDataType(string dataType)
+    {
+        if (pointEditor is null)
+        {
+            return;
+        }
+        pointEditor.DataType = dataType;
+        pointEditor.NumberType ??= ScpiNumberTypes.Double;
+        pointEditor.StringFormat ??= ScpiStringFormats.Raw;
+        pointEditor.EnumFormat ??= ScpiEnumFormats.Value;
+    }
+
+    private void OpenEnumDialog(int? index = null)
+    {
+        if (pointEditor is null)
+        {
+            return;
+        }
+        enumEditIndex = index;
+        enumEditor = index is null
+            ? new ScpiEnumOption
+            {
+                SortOrder = pointEditor.EnumOptions.Count == 0
+                    ? 0
+                    : pointEditor.EnumOptions.Max(option => option.SortOrder) + 1
+            }
+            : CloneEnumOption(pointEditor.EnumOptions[index.Value]);
+        enumDialogOpen = true;
+    }
+
+    private void CloseEnumDialog()
+    {
+        enumDialogOpen = false;
+        enumEditor = null;
+        enumEditIndex = null;
+    }
+
+    private async Task ApplyEnumOptionAsync()
+    {
+        if (pointEditor is null || enumEditor is null)
+        {
+            return;
+        }
+
+        var displayName = enumEditor.DisplayName.Trim();
+        var value = enumEditor.Value.Trim();
+        if (displayName.Length == 0 || value.Length == 0)
+        {
+            await ScreenAlerts.ShowAsync("Enum display name and SCPI value are required.", ScreenAlertSeverity.Error, "Enum option");
+            return;
+        }
+
+        var duplicates = pointEditor.EnumOptions
+            .Where((_, index) => enumEditIndex is null || index != enumEditIndex.Value)
+            .ToList();
+        if (duplicates.Any(option => option.Value.Equals(value, StringComparison.OrdinalIgnoreCase)))
+        {
+            await ScreenAlerts.ShowAsync($"Enum value '{value}' is already in use.", ScreenAlertSeverity.Error, "Enum option");
+            return;
+        }
+        if (duplicates.Any(option => option.Code == enumEditor.Code))
+        {
+            await ScreenAlerts.ShowAsync($"Enum code '{enumEditor.Code}' is already in use.", ScreenAlertSeverity.Error, "Enum option");
+            return;
+        }
+
+        enumEditor.DisplayName = displayName;
+        enumEditor.Value = value;
+        if (enumEditIndex is null)
+        {
+            pointEditor.EnumOptions.Add(CloneEnumOption(enumEditor));
+        }
+        else
+        {
+            pointEditor.EnumOptions[enumEditIndex.Value] = CloneEnumOption(enumEditor);
+        }
+        CloseEnumDialog();
+    }
+
+    private void ConfirmDeleteEndpoint(ScpiEndpointConfig endpoint)
+    {
+        deleteEndpoint = endpoint;
+        deletePoint = null;
+    }
+
+    private void ConfirmDeletePoint(ScpiPointConfig point)
+    {
+        deletePoint = point;
+        deleteEndpoint = null;
+    }
+
+    private void DismissDelete()
+    {
+        if (!saving)
+        {
+            ClearDelete();
+        }
+    }
+
+    private void ClearDelete()
+    {
+        deleteEndpoint = null;
+        deletePoint = null;
+    }
+
+    private async Task DeleteEndpointAsync()
+    {
+        if (saving || deleteEndpoint is null)
+        {
+            return;
+        }
+
+        try
+        {
+            saving = true;
+            await Endpoints.DeleteAsync(deleteEndpoint.Id, deleteEndpoint.ConcurrencyStamp, disposal.Token);
+            ClearDelete();
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync("SCPI endpoint deleted.", ScreenAlertSeverity.Success, "EndpointLink");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (ScpiConfigurationConcurrencyException ex)
+        {
+            ClearDelete();
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Warning, "Stale endpoint delete");
+        }
+        catch (Exception ex)
+        {
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Endpoint delete failed");
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    private async Task DeletePointAsync()
+    {
+        if (saving || deletePoint is null)
+        {
+            return;
+        }
+
+        try
+        {
+            saving = true;
+            await Points.DeleteAsync(deletePoint.Id, deletePoint.ConcurrencyStamp, disposal.Token);
+            ClearDelete();
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync("SCPI point deleted.", ScreenAlertSeverity.Success, "EndpointLink");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (ScpiConfigurationConcurrencyException ex)
+        {
+            ClearDelete();
+            await LoadAsync();
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Warning, "Stale point delete");
+        }
+        catch (Exception ex)
+        {
+            await ScreenAlerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Point delete failed");
+        }
+        finally
+        {
+            saving = false;
+        }
+    }
+
+    private void ConfirmRemoveEnumOption(int index) => removeEnumIndex = index;
+
+    private void CancelRemoveEnumOption() => removeEnumIndex = null;
+
+    private void RemoveEnumOption()
+    {
+        if (pointEditor is null || removeEnumIndex is null)
+        {
+            return;
+        }
+        pointEditor.EnumOptions.RemoveAt(removeEnumIndex.Value);
+        removeEnumIndex = null;
+    }
+
+    private ScpiEndpointConfig NewEndpoint() =>
+        new()
+        {
+            Transport = ScpiEndpointService.TcpTransport,
+            TcpHost = "127.0.0.1",
+            TcpPort = 5025,
+            TimeoutMs = ScpiSettings.Value.DefaultTimeoutMs,
+            PollingIntervalMs = ScpiSettings.Value.DefaultPollingIntervalMs,
+            ConverterId = RedisScpiSettings.Value.ConverterId,
+            ErrorCheckMode = ScpiSettings.Value.DefaultErrorCheckMode,
+            ErrorQueueQuery = ScpiSettings.Value.DefaultErrorQueueQuery,
+            CommandTerminator = ScpiSettings.Value.DefaultCommandTerminator,
+            ResponseTerminator = ScpiSettings.Value.DefaultResponseTerminator,
+            Enabled = true
+        };
+
+    private static ScpiPointConfig NewPoint(int endpointId) =>
+        new()
+        {
+            EndpointConfigId = endpointId,
+            Enabled = false,
+            PollingEnabled = false,
+            InitialRead = true,
+            Access = ScpiAccessModes.Readonly,
+            DataType = ScpiDataTypes.String,
+            NumberType = ScpiNumberTypes.Double,
+            StringFormat = ScpiStringFormats.Raw,
+            EnumFormat = ScpiEnumFormats.Value,
+            ReadTemplate = "{name}?"
+        };
+
+    private static ScpiEndpointConfig CloneEndpoint(ScpiEndpointConfig source) =>
+        new()
+        {
+            Id = source.Id,
+            EndpointId = source.EndpointId,
+            DisplayName = source.DisplayName,
+            Enabled = source.Enabled,
+            Transport = source.Transport,
+            TcpHost = source.TcpHost,
+            TcpPort = source.TcpPort,
+            TimeoutMs = source.TimeoutMs,
+            PollingIntervalMs = source.PollingIntervalMs,
+            ConverterId = source.ConverterId,
+            ErrorCheckMode = source.ErrorCheckMode,
+            ErrorQueueQuery = source.ErrorQueueQuery,
+            CommandTerminator = source.CommandTerminator,
+            ResponseTerminator = source.ResponseTerminator,
+            CreatedAt = source.CreatedAt,
+            UpdatedAt = source.UpdatedAt,
+            ConcurrencyStamp = source.ConcurrencyStamp
+        };
+
+    private static ScpiPointConfig ClonePoint(ScpiPointConfig source) =>
+        new()
+        {
+            Id = source.Id,
+            EndpointConfigId = source.EndpointConfigId,
+            PointId = source.PointId,
+            SourcePath = source.SourcePath,
+            Name = source.Name,
+            DisplayName = source.DisplayName,
+            Enabled = source.Enabled,
+            Access = source.Access,
+            DataType = source.DataType,
+            NumberType = source.NumberType,
+            StringFormat = source.StringFormat,
+            EnumFormat = source.EnumFormat,
+            ReadTemplate = source.ReadTemplate,
+            WriteTemplate = source.WriteTemplate,
+            Unit = source.Unit,
+            PollingEnabled = source.PollingEnabled,
+            PollingIntervalMs = source.PollingIntervalMs,
+            InitialRead = source.InitialRead,
+            CreatedAt = source.CreatedAt,
+            UpdatedAt = source.UpdatedAt,
+            ConcurrencyStamp = source.ConcurrencyStamp,
+            EnumOptions = source.EnumOptions
+                .OrderBy(option => option.SortOrder)
+                .ThenBy(option => option.Id)
+                .Select(CloneEnumOption)
+                .ToList()
+        };
+
+    private static ScpiEnumOption CloneEnumOption(ScpiEnumOption source) =>
+        new()
+        {
+            Id = source.Id,
+            ScpiPointConfigId = source.ScpiPointConfigId,
+            DisplayName = source.DisplayName,
+            Value = source.Value,
+            Code = source.Code,
+            SortOrder = source.SortOrder,
+            CreatedAt = source.CreatedAt,
+            UpdatedAt = source.UpdatedAt
+        };
+
+    private static string DisplayPoint(ScpiPointConfig point) =>
+        string.IsNullOrWhiteSpace(point.DisplayName) ? point.PointId : point.DisplayName;
+
+    private static string DisplayPointType(ScpiPointConfig point) =>
+        point.DataType switch
+        {
+            ScpiDataTypes.Number => $"number/{point.NumberType}",
+            ScpiDataTypes.String => $"string/{point.StringFormat}",
+            ScpiDataTypes.Enum => $"enum/{point.EnumFormat}",
+            _ => point.DataType
+        };
+
+    private static string StatusBadgeClass(bool enabled) =>
+        enabled ? "status-badge success" : "status-badge neutral";
+
+    private static string EnumOptionKey(ScpiEnumOption option, int index) =>
+        option.Id > 0 ? $"id:{option.Id}" : $"draft:{index}:{option.Value}:{option.Code}";
+
+    private static string EscapeTerminator(string value) =>
+        value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal);
+
+    private static string UnescapeTerminator(string value)
+    {
+        var builder = new System.Text.StringBuilder(value.Length);
+        for (var index = 0; index < value.Length; index++)
+        {
+            var current = value[index];
+            if (current != '\\')
+            {
+                builder.Append(current);
+                continue;
+            }
+            if (++index >= value.Length)
+            {
+                throw new InvalidOperationException("A terminator escape sequence is incomplete.");
+            }
+
+            builder.Append(value[index] switch
+            {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                _ => throw new InvalidOperationException($"Unsupported terminator escape sequence '\\{value[index]}'.")
+            });
+        }
+
+        if (builder.Length == 0)
+        {
+            throw new InvalidOperationException("A terminator is required.");
+        }
+        return builder.ToString();
+    }
+
+    public void Dispose()
+    {
+        disposal.Cancel();
+    }
+}

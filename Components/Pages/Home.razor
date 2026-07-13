@@ -1,0 +1,115 @@
+@page "/"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject RuntimeModeService Runtime
+
+<PageTitle>Runtime</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Runtime</h1>
+        <p class="page-kicker">Live SCPI transport, polling, command, and Redis output state.</p>
+    </div>
+    <div class="muted-metadata">Updated @state.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</div>
+</div>
+
+<section class="status-grid">
+    <div class="status-tile">
+        <div class="label">Mode</div>
+        <div class="value"><span class="@StatusBadgeClass(state.Mode.ToString())">@state.Mode</span></div>
+        <p>@state.Message</p>
+    </div>
+    <div class="status-tile">
+        <div class="label">Redis output</div>
+        <div class="value"><span class="@StatusBadgeClass(state.RedisOutputStatus.ToString())">@state.RedisOutputStatus</span></div>
+        <p>@state.RedisOutputMessage</p>
+    </div>
+    <div class="status-tile">
+        <div class="label">Endpoint configuration</div>
+        <div class="value"><span class="@StatusBadgeClass(state.EndpointStatus.ToString())">@state.EndpointStatus</span></div>
+        <p>@state.EndpointMessage</p>
+    </div>
+    <div class="status-tile">
+        <div class="label">SCPI transport</div>
+        <div class="value"><span class="@StatusBadgeClass(state.TransportStatus.ToString())">@state.TransportStatus</span></div>
+        <p>@state.TransportMessage</p>
+    </div>
+    <div class="status-tile">
+        <div class="label">Polling</div>
+        <div class="value"><span class="@StatusBadgeClass(state.PollingStatus.ToString())">@state.PollingStatus</span></div>
+        <p>@state.PollingMessage</p>
+    </div>
+    <div class="status-tile">
+        <div class="label">Commands</div>
+        <div class="value"><span class="@StatusBadgeClass(state.CommandStatus.ToString())">@state.CommandStatus</span></div>
+        <p>@state.CommandMessage</p>
+    </div>
+</section>
+
+<div class="toolbar">
+    <div>
+        <h2 class="toolbar-title">Current diagnostics</h2>
+        <div class="muted-metadata">Bounded runtime summaries; detailed records remain available in Log.</div>
+    </div>
+</div>
+
+@if (state.RedisOutputDiagnostics.Count == 0 && state.RuntimeDiagnostics.Count == 0)
+{
+    <div class="empty-state">No active runtime diagnostic is reported.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead><tr><th>Subsystem</th><th>Scope</th><th>Status</th><th>Message</th><th class="numeric">Updated</th></tr></thead>
+            <tbody>
+            @foreach (var item in state.RedisOutputDiagnostics.Take(100))
+            {
+                <tr>
+                    <td>Redis / @item.Origin</td>
+                    <td><code>@item.SourcePath</code><div class="muted-metadata"><code>@item.RedisKey</code></div></td>
+                    <td><span class="@StatusBadgeClass(item.Status)">@item.Status</span></td>
+                    <td>@item.Message</td>
+                    <td class="numeric">@item.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                </tr>
+            }
+            @foreach (var item in state.RuntimeDiagnostics.Take(100))
+            {
+                <tr>
+                    <td>@item.Subsystem</td>
+                    <td><code>@item.Scope</code></td>
+                    <td><span class="@StatusBadgeClass(item.Status)">@item.Status</span></td>
+                    <td>@item.Message</td>
+                    <td class="numeric">@item.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private RuntimeState state = default!;
+
+    protected override void OnInitialized()
+    {
+        state = Runtime.Current;
+        Runtime.Changed += OnRuntimeChanged;
+    }
+
+    private void OnRuntimeChanged(RuntimeState updated)
+    {
+        state = updated;
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Runtime.Changed -= OnRuntimeChanged;
+
+    private static string StatusBadgeClass(string? status) => status?.ToLowerInvariant() switch
+    {
+        "normal" or "good" or "success" or "online" or "ok" => "status-badge success",
+        "starting" or "unset" or "heartbeat" or "pending" => "status-badge warning",
+        "degraded" or "bad" or "failed" or "error" or "stale" or "offline" => "status-badge danger",
+        _ => "status-badge neutral"
+    };
+}

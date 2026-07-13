@@ -1,0 +1,24 @@
+@inherits LayoutComponentBase
+
+<div class="app-shell">
+    <aside class="sidebar">
+        <NavMenu />
+    </aside>
+    <main class="main-panel">
+        <header class="topbar">
+            <span>RedisScpi v1.0</span>
+            <span class="topbar-subtitle">SCPI RedisProtocolConverter</span>
+        </header>
+        <article class="content">
+            @Body
+        </article>
+    </main>
+</div>
+
+<ScreenAlertHost />
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error occurred.
+    <a href="." class="reload">Reload</a>
+    <button class="dismiss" type="button">x</button>
+</div>

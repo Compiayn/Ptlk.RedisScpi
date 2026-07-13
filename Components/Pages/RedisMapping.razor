@@ -1,0 +1,490 @@
+@page "/redis-mapping"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject RedisMappingValidationService Mappings
+@inject PathSuggestionService SourceSuggestions
+@inject RedisKeySuggestionService RedisSuggestions
+@inject ScreenAlertService Alerts
+
+<PageTitle>RedisMapping</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>RedisMapping</h1>
+        <p class="page-kicker">Map one SCPI SourcePath to one Asset-owned <code>point:</code> key.</p>
+    </div>
+    <button class="btn btn-primary" type="button" @onclick="OpenAdd">Add mapping</button>
+</div>
+
+@if (loading)
+{
+    <div class="loading-state" role="status">Loading mappings…</div>
+}
+else if (!string.IsNullOrWhiteSpace(loadError))
+{
+    <div class="error-state" role="alert">@loadError <button class="btn btn-sm btn-outline-primary" type="button" @onclick="LoadAsync">Retry</button></div>
+}
+else if (items.Count == 0)
+{
+    <div class="empty-state">No mapping exists. Add a disabled SCPI point first, then map it to an Asset point key.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead><tr><th>SCPI SourcePath</th><th>Redis point key</th><th class="numeric">Updated</th><th>Actions</th></tr></thead>
+            <tbody>
+            @foreach (var item in items)
+            {
+                <tr>
+                    <td><code>@item.SourcePath</code></td>
+                    <td><code>@item.RedisKey</code></td>
+                    <td class="numeric">@item.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                    <td><div class="actions">
+                        <button class="btn btn-sm btn-outline-primary" type="button" @onclick="() => OpenEdit(item)">Edit</button>
+                        <button class="btn btn-sm btn-outline-danger" type="button" @onclick="() => deleting = item">Delete</button>
+                    </div></td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+@if (editing)
+{
+    <div class="dialog-backdrop" role="presentation">
+        <section class="dialog-panel" role="dialog" aria-modal="true" aria-labelledby="mapping-dialog-title">
+            <header class="dialog-header">
+                <div>
+                    <h2 id="mapping-dialog-title">@(model.Id == 0 ? "Add mapping" : "Edit mapping")</h2>
+                    <div class="muted-metadata">Autocomplete helps fill values; the same service validation applies to manual input.</div>
+                </div>
+                <button class="dialog-close" type="button" aria-label="Close" disabled="@(saving || validating)" @onclick="CloseEditor">x</button>
+            </header>
+            <div class="dialog-body">
+                @if (!string.IsNullOrWhiteSpace(editorError))
+                {
+                    <div class="validation-summary-errors" role="alert">@editorError</div>
+                }
+                @if (!string.IsNullOrWhiteSpace(validationMessage))
+                {
+                    <div class="@(validationSuccess ? "empty-state" : "validation-summary-errors")" role="status">@validationMessage</div>
+                }
+                <div class="form-grid">
+                    <div class="form-group full sourcepath-autocomplete" @onkeydown="SourceKeyDown">
+                         <label class="form-label" for="mapping-source">SCPI SourcePath</label>
+                         <input id="mapping-source" class="form-control" value="@model.SourcePath" @oninput="SourceChanged"
+                                disabled="@(saving || validating)" autocomplete="off" aria-autocomplete="list" aria-expanded="@sourceOpen" aria-controls="source-suggestions" />
+                        <div class="form-text">Search fields: SourcePath, endpoint id, point id, SCPI name, and display name. Selection fills SourcePath.</div>
+                        @if (sourceOpen)
+                        {
+                            <div id="source-suggestions" class="sourcepath-suggestion-menu" role="listbox">
+                                @if (sourceLoading && sourceItems.Count == 0)
+                                {
+                                    <div class="sourcepath-suggestion-state" role="status">Searching SCPI points…</div>
+                                }
+                                else if (!string.IsNullOrWhiteSpace(sourceError))
+                                {
+                                    <div class="sourcepath-suggestion-state" role="alert">@sourceError</div>
+                                }
+                                else if (sourceItems.Count == 0)
+                                {
+                                    <div class="sourcepath-suggestion-state">No SCPI point matches this query.</div>
+                                }
+                                @foreach (var candidate in sourceItems)
+                                {
+                                    <button class="sourcepath-suggestion-item" type="button" role="option" @onclick="() => SelectSource(candidate)">
+                                        <span class="sourcepath-suggestion-main">@Highlight(candidate.DisplayName ?? candidate.Name, model.SourcePath)</span>
+                                        <span class="sourcepath-suggestion-detail">@Highlight(candidate.SourcePath, model.SourcePath)</span>
+                                        <span class="sourcepath-suggestion-meta">@candidate.EndpointId · @candidate.DataType · @candidate.Access · @(candidate.Enabled ? "enabled" : "draft")</span>
+                                    </button>
+                                }
+                                @if (sourceHasMore)
+                                {
+                                    <button class="sourcepath-suggestion-load-more" type="button" disabled="@sourceLoading" @onclick="LoadMoreSourcesAsync">@(sourceLoading ? "Loading…" : "Load more")</button>
+                                }
+                            </div>
+                        }
+                    </div>
+
+                    <div class="form-group full sourcepath-autocomplete" @onkeydown="RedisKeyDown">
+                         <label class="form-label" for="mapping-key">Redis point key</label>
+                         <input id="mapping-key" class="form-control" value="@model.RedisKey" @oninput="RedisKeyChanged"
+                                disabled="@(saving || validating)" autocomplete="off" aria-autocomplete="list" aria-expanded="@redisOpen" aria-controls="redis-suggestions" />
+                        <div class="form-text">Search matches the point key path. Context-only type, access, and unit do not participate in search. Selection fills RedisKey.</div>
+                        @if (redisOpen)
+                        {
+                            <div id="redis-suggestions" class="sourcepath-suggestion-menu" role="listbox">
+                                @if (redisLoading && redisItems.Count == 0)
+                                {
+                                    <div class="sourcepath-suggestion-state" role="status">Scanning bounded Redis point candidates…</div>
+                                }
+                                else if (!string.IsNullOrWhiteSpace(redisError))
+                                {
+                                    <div class="sourcepath-suggestion-state" role="alert">@redisError</div>
+                                }
+                                else if (redisItems.Count == 0)
+                                {
+                                    <div class="sourcepath-suggestion-state">No Redis point key matches this query.</div>
+                                }
+                                @foreach (var candidate in redisItems)
+                                {
+                                    <button class="sourcepath-suggestion-item" type="button" role="option" @onclick="() => SelectRedis(candidate)">
+                                        <span class="sourcepath-suggestion-main">@Highlight(candidate.RedisKey, model.RedisKey)</span>
+                                        <span class="sourcepath-suggestion-meta">type @(candidate.Type ?? "-") · access @(candidate.Access ?? "-") · unit @(candidate.Unit ?? "") · @(candidate.HasCompleteMetadata ? "metadata ready" : "metadata incomplete")</span>
+                                    </button>
+                                }
+                                @if (redisHasMore)
+                                {
+                                    <button class="sourcepath-suggestion-load-more" type="button" disabled="@redisLoading" @onclick="LoadMoreRedisAsync">@(redisLoading ? "Loading…" : "Load more")</button>
+                                }
+                            </div>
+                        }
+                    </div>
+                </div>
+            </div>
+            <footer class="dialog-footer">
+                <button class="btn btn-secondary" type="button" disabled="@(saving || validating)" @onclick="CloseEditor">Cancel</button>
+                <button class="btn btn-outline-primary" type="button" disabled="@(saving || validating)" @onclick="ValidateAsync">@(validating ? "Validating..." : "Validate")</button>
+                <button class="btn btn-primary" type="button" disabled="@(saving || validating)" @onclick="SaveAsync">@(saving ? "Applying…" : "Apply")</button>
+            </footer>
+        </section>
+    </div>
+}
+
+@if (deleting is not null)
+{
+    <div class="dialog-backdrop" role="presentation">
+        <section class="dialog-panel" style="max-width:520px" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+            <header class="dialog-header"><h2 id="delete-title">Delete mapping?</h2></header>
+            <div class="dialog-body">Delete <code>@deleting.SourcePath</code> → <code>@deleting.RedisKey</code>? The SCPI point must already be disabled with polling off.</div>
+            <footer class="dialog-footer">
+                <button class="btn btn-secondary" type="button" disabled="@deletingBusy" @onclick="() => deleting = null">Cancel</button>
+                <button class="btn btn-danger" type="button" disabled="@deletingBusy" @onclick="DeleteAsync">@(deletingBusy ? "Deleting..." : "Delete")</button>
+            </footer>
+        </section>
+    </div>
+}
+
+@code {
+    private readonly CancellationTokenSource disposal = new();
+    private List<Ptlk.RedisScpi.Models.RedisMapping> items = [];
+    private Ptlk.RedisScpi.Models.RedisMapping model = new();
+    private Ptlk.RedisScpi.Models.RedisMapping? deleting;
+    private bool loading;
+    private bool editing;
+    private bool saving;
+    private bool validating;
+    private bool deletingBusy;
+    private string? loadError;
+    private string? editorError;
+    private string? validationMessage;
+    private bool validationSuccess;
+
+    private CancellationTokenSource? sourceQuery;
+    private List<SourcePathSuggestion> sourceItems = [];
+    private bool sourceOpen;
+    private bool sourceLoading;
+    private bool sourceHasMore;
+    private int sourceOffset;
+    private int sourceRevision;
+    private string? sourceError;
+
+    private CancellationTokenSource? redisQuery;
+    private List<RedisKeySuggestion> redisItems = [];
+    private bool redisOpen;
+    private bool redisLoading;
+    private bool redisHasMore;
+    private long redisCursor;
+    private int redisPageOffset;
+    private int redisRevision;
+    private string? redisError;
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        if (loading || disposal.IsCancellationRequested) return;
+        loading = true;
+        loadError = null;
+        try { items = await Mappings.ListAsync(disposal.Token); }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested) { }
+        catch (Exception ex) { loadError = $"Mapping load failed: {ex.Message}"; }
+        finally { loading = false; }
+    }
+
+    private void OpenAdd()
+    {
+        model = new Ptlk.RedisScpi.Models.RedisMapping();
+        OpenEditor();
+    }
+
+    private void OpenEdit(Ptlk.RedisScpi.Models.RedisMapping item)
+    {
+        model = new Ptlk.RedisScpi.Models.RedisMapping { Id = item.Id, SourcePath = item.SourcePath, RedisKey = item.RedisKey, ConcurrencyStamp = item.ConcurrencyStamp };
+        OpenEditor();
+    }
+
+    private void OpenEditor()
+    {
+        editing = true;
+        editorError = null;
+        validationMessage = null;
+        sourceItems = [];
+        redisItems = [];
+        sourceOpen = false;
+        redisOpen = false;
+    }
+
+    private void CloseEditor()
+    {
+        if (saving || validating) return;
+        editing = false;
+        CancelQueries();
+    }
+
+    private async Task ValidateAsync()
+    {
+        if (saving || validating) return;
+        validating = true;
+        editorError = null;
+        try
+        {
+            var result = await Mappings.ValidateAsync(model.SourcePath, model.RedisKey, model.Id == 0 ? null : model.Id, disposal.Token);
+            validationSuccess = result.Success;
+            validationMessage = result.Success ? "Mapping validation passed." : result.Error;
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            validationSuccess = false;
+            validationMessage = null;
+            editorError = $"Mapping validation failed: {ex.Message}";
+        }
+        finally
+        {
+            validating = false;
+        }
+    }
+
+    private async Task SaveAsync()
+    {
+        if (saving || validating) return;
+        saving = true;
+        editorError = null;
+        try
+        {
+            var result = await Mappings.ValidateAsync(model.SourcePath, model.RedisKey, model.Id == 0 ? null : model.Id, disposal.Token);
+            if (!result.Success) { editorError = result.Error; return; }
+            await Mappings.CreateOrUpdateAsync(
+                model.Id == 0 ? null : model.Id,
+                model.SourcePath,
+                model.RedisKey,
+                model.Id == 0 ? null : model.ConcurrencyStamp,
+                disposal.Token);
+            editing = false;
+            await LoadAsync();
+            await Alerts.ShowAsync("RedisMapping applied.", ScreenAlertSeverity.Success, "Mapping saved");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            editorError = ex.Message;
+            await Alerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Mapping save failed");
+        }
+        finally { saving = false; }
+    }
+
+    private async Task DeleteAsync()
+    {
+        if (deletingBusy || deleting is null) return;
+        deletingBusy = true;
+        try
+        {
+            await Mappings.DeleteAsync(deleting.Id, deleting.ConcurrencyStamp, disposal.Token);
+            deleting = null;
+            await LoadAsync();
+            await Alerts.ShowAsync("RedisMapping deleted.", ScreenAlertSeverity.Success, "Mapping deleted");
+        }
+        catch (OperationCanceledException) when (disposal.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            await Alerts.ShowAsync(ex.Message, ScreenAlertSeverity.Error, "Delete failed");
+        }
+        finally
+        {
+            deletingBusy = false;
+        }
+    }
+
+    private void SourceChanged(ChangeEventArgs args)
+    {
+        InvalidateValidation();
+        model.SourcePath = args.Value?.ToString() ?? "";
+        sourceOpen = !string.IsNullOrWhiteSpace(model.SourcePath);
+        sourceOffset = 0;
+        sourceItems = [];
+        _ = DebouncedSourceAsync(++sourceRevision, model.SourcePath);
+    }
+
+    private async Task DebouncedSourceAsync(int revision, string query)
+    {
+        var current = CancellationTokenSource.CreateLinkedTokenSource(disposal.Token);
+        var previous = sourceQuery;
+        sourceQuery = current;
+        previous?.Cancel();
+        try
+        {
+            await Task.Delay(250, current.Token);
+            await QuerySourcesAsync(revision, query, append: false, current.Token);
+        }
+        catch (OperationCanceledException) when (current.IsCancellationRequested) { }
+        finally
+        {
+            if (ReferenceEquals(sourceQuery, current)) sourceQuery = null;
+            current.Dispose();
+        }
+    }
+
+    private Task LoadMoreSourcesAsync() => sourceLoading
+        ? Task.CompletedTask
+        : QuerySourcesAsync(sourceRevision, model.SourcePath, append: true, disposal.Token);
+
+    private async Task QuerySourcesAsync(int revision, string query, bool append, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(query)) { sourceOpen = false; return; }
+        sourceLoading = true; sourceError = null;
+        try
+        {
+            var page = await SourceSuggestions.SearchPointSuggestionsAsync(query, 24, append ? sourceOffset : 0, token);
+            if (revision != sourceRevision) return;
+            if (append) sourceItems.AddRange(page.Items); else sourceItems = page.Items.ToList();
+            sourceHasMore = page.HasMore; sourceOffset = page.NextOffset; sourceOpen = true;
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) { if (revision == sourceRevision) sourceError = ex.Message; }
+        finally { if (revision == sourceRevision) sourceLoading = false; }
+    }
+
+    private void SelectSource(SourcePathSuggestion item)
+    {
+        InvalidateValidation();
+        sourceRevision++;
+        sourceQuery?.Cancel();
+        model.SourcePath = item.SourcePath;
+        sourceOpen = false;
+    }
+
+    private void RedisKeyChanged(ChangeEventArgs args)
+    {
+        InvalidateValidation();
+        model.RedisKey = args.Value?.ToString() ?? "";
+        redisOpen = !string.IsNullOrWhiteSpace(model.RedisKey);
+        redisCursor = 0; redisPageOffset = 0; redisItems = [];
+        _ = DebouncedRedisAsync(++redisRevision, model.RedisKey);
+    }
+
+    private async Task DebouncedRedisAsync(int revision, string query)
+    {
+        var current = CancellationTokenSource.CreateLinkedTokenSource(disposal.Token);
+        var previous = redisQuery;
+        redisQuery = current;
+        previous?.Cancel();
+        try
+        {
+            await Task.Delay(250, current.Token);
+            await QueryRedisAsync(revision, query, append: false, current.Token);
+        }
+        catch (OperationCanceledException) when (current.IsCancellationRequested) { }
+        finally
+        {
+            if (ReferenceEquals(redisQuery, current)) redisQuery = null;
+            current.Dispose();
+        }
+    }
+
+    private Task LoadMoreRedisAsync() => redisLoading
+        ? Task.CompletedTask
+        : QueryRedisAsync(redisRevision, model.RedisKey, append: true, disposal.Token);
+
+    private async Task QueryRedisAsync(int revision, string query, bool append, CancellationToken token)
+    {
+        if (string.IsNullOrWhiteSpace(query)) { redisOpen = false; return; }
+        redisLoading = true; redisError = null;
+        try
+        {
+            var page = await RedisSuggestions.SearchPointKeysAsync(query, 24, append ? redisCursor : 0, append ? redisPageOffset : 0, token);
+            if (revision != redisRevision) return;
+            if (append)
+            {
+                redisItems = redisItems
+                    .Concat(page.Items)
+                    .DistinctBy(item => item.RedisKey, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+            else
+            {
+                redisItems = page.Items.ToList();
+            }
+            redisHasMore = page.HasMore; redisCursor = page.NextCursor; redisPageOffset = page.NextPageOffset; redisOpen = true;
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception ex) { if (revision == redisRevision) redisError = ex.Message; }
+        finally { if (revision == redisRevision) redisLoading = false; }
+    }
+
+    private void SelectRedis(RedisKeySuggestion item)
+    {
+        InvalidateValidation();
+        redisRevision++;
+        redisQuery?.Cancel();
+        model.RedisKey = item.RedisKey;
+        redisOpen = false;
+    }
+
+    private void InvalidateValidation()
+    {
+        validationMessage = null;
+        validationSuccess = false;
+        editorError = null;
+    }
+    private void SourceKeyDown(KeyboardEventArgs args) { if (args.Key == "Escape") sourceOpen = false; }
+    private void RedisKeyDown(KeyboardEventArgs args) { if (args.Key == "Escape") redisOpen = false; }
+
+    private static MarkupString Highlight(string text, string query)
+    {
+        var encoded = System.Text.Encodings.Web.HtmlEncoder.Default.Encode(text);
+        var needle = query.StartsWith("scpi:", StringComparison.OrdinalIgnoreCase) || query.StartsWith("point:", StringComparison.OrdinalIgnoreCase)
+            ? query : query.Trim();
+        if (string.IsNullOrWhiteSpace(needle)) return new MarkupString(encoded);
+        var encodedNeedle = System.Text.Encodings.Web.HtmlEncoder.Default.Encode(needle);
+        var highlighted = System.Text.RegularExpressions.Regex.Replace(
+            encoded,
+            System.Text.RegularExpressions.Regex.Escape(encodedNeedle),
+            "<mark>$0</mark>",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return new MarkupString(highlighted);
+    }
+
+    private void CancelQueries()
+    {
+        sourceRevision++;
+        redisRevision++;
+        sourceQuery?.Cancel(); sourceQuery = null;
+        redisQuery?.Cancel(); redisQuery = null;
+    }
+
+    public void Dispose()
+    {
+        CancelQueries();
+        disposal.Cancel();
+        disposal.Dispose();
+    }
+}

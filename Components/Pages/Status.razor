@@ -1,0 +1,214 @@
+@page "/status"
+@rendermode InteractiveServer
+@implements IDisposable
+@inject RuntimeModeService Runtime
+@inject RedisPointOwnershipService Ownership
+
+<PageTitle>Status</PageTitle>
+
+<div class="page-header">
+    <div>
+        <h1>Status</h1>
+        <p class="page-kicker">Redis readiness, Asset initialization, and point ownership snapshot.</p>
+    </div>
+    <button class="btn btn-outline-primary" type="button" @onclick="Refresh">Refresh</button>
+</div>
+
+<section class="surface">
+    <div class="status-grid" style="margin:0">
+        <div>
+            <div class="muted-metadata">Mode</div>
+            <span class="@StatusBadgeClass(state.Mode.ToString())">@state.Mode</span>
+        </div>
+        <div>
+            <div class="muted-metadata">Redis connected</div>
+            <span class="@StatusBadgeClass(state.RedisConnected ? "normal" : "degraded")">@state.RedisConnected</span>
+        </div>
+        <div>
+            <div class="muted-metadata">Asset initialized</div>
+            <span class="@StatusBadgeClass(state.AssetInitialized ? "normal" : "degraded")">@state.AssetInitialized</span>
+        </div>
+        <div>
+            <div class="muted-metadata">Runtime updated</div>
+            <div class="numeric">@state.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</div>
+        </div>
+    </div>
+    <p style="margin-bottom:0">@state.Message</p>
+</section>
+
+<div class="toolbar">
+    <div>
+        <h2 class="toolbar-title">Runtime subsystems</h2>
+        <div class="muted-metadata">Redis output, endpoint configuration, transport, polling, command, and SCPI diagnostic health.</div>
+    </div>
+</div>
+
+<div class="table-responsive">
+    <table class="table">
+        <thead><tr><th>Subsystem</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody>
+        @foreach (var subsystem in Subsystems)
+        {
+            <tr>
+                <td>@subsystem.Name</td>
+                <td><span class="@StatusBadgeClass(subsystem.Status.ToString())">@subsystem.Status</span></td>
+                <td>@subsystem.Message</td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</div>
+
+<div class="toolbar">
+    <div>
+        <h2 class="toolbar-title">Ownership claims</h2>
+        <div class="muted-metadata">Owner is ConverterId; owner_source is the RedisScpi SourceName.</div>
+    </div>
+</div>
+
+@if (claims.Count == 0)
+{
+    <div class="empty-state">No SCPI mapping ownership claim is tracked yet.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead><tr><th>SourcePath</th><th>Redis key</th><th>Status</th><th>Owner</th></tr></thead>
+            <tbody>
+            @foreach (var claim in claims)
+            {
+                <tr>
+                    <td><code>@claim.SourcePath</code></td>
+                    <td><code>@claim.RedisKey</code></td>
+                    <td><span class="@StatusBadgeClass(claim.Status)">@claim.Status</span></td>
+                    <td>@(claim.Owner ?? "-")</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+<div class="toolbar">
+    <div>
+        <h2 class="toolbar-title">Redis output diagnostics</h2>
+        <div class="muted-metadata">Mapping, PointState writer, publish, and ownership issues remain visible until recovery.</div>
+    </div>
+</div>
+
+@if (state.RedisOutputDiagnostics.Count == 0)
+{
+    <div class="empty-state">No Redis output diagnostic is active.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead><tr><th>Updated</th><th>Origin</th><th>SourcePath / Redis key</th><th>Status</th><th>Message</th></tr></thead>
+            <tbody>
+            @foreach (var diagnostic in state.RedisOutputDiagnostics)
+            {
+                <tr>
+                    <td class="numeric">@diagnostic.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                    <td>@diagnostic.Origin</td>
+                    <td><code>@diagnostic.SourcePath</code><div class="muted-metadata"><code>@diagnostic.RedisKey</code></div></td>
+                    <td><span class="@StatusBadgeClass(diagnostic.Status)">@diagnostic.Status</span></td>
+                    <td>@diagnostic.Message</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+<div class="toolbar">
+    <div>
+        <h2 class="toolbar-title">Runtime diagnostics</h2>
+        <div class="muted-metadata">Endpoint, transport, polling, command, stale accepted command, and SCPI scopes.</div>
+    </div>
+</div>
+
+@if (state.RuntimeDiagnostics.Count == 0)
+{
+    <div class="empty-state">No runtime diagnostic is active.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table">
+            <thead><tr><th>Updated</th><th>Subsystem / Scope</th><th>Status</th><th>Message</th></tr></thead>
+            <tbody>
+            @foreach (var diagnostic in state.RuntimeDiagnostics)
+            {
+                <tr>
+                    <td class="numeric">@diagnostic.UpdatedAt.LocalDateTime.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                    <td>@diagnostic.Subsystem<div class="muted-metadata"><code>@diagnostic.Scope</code></div></td>
+                    <td><span class="@StatusBadgeClass(diagnostic.Status)">@diagnostic.Status</span></td>
+                    <td>@diagnostic.Message</td>
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private RuntimeState state = default!;
+    private IReadOnlyCollection<PointOwnershipClaimResult> claims = [];
+
+    private IReadOnlyList<SubsystemRow> Subsystems =>
+    [
+        new("Redis output", state.RedisOutputStatus, state.RedisOutputMessage),
+        new("Endpoint", state.EndpointStatus, state.EndpointMessage),
+        new("Transport", state.TransportStatus, state.TransportMessage),
+        new("Polling", state.PollingStatus, state.PollingMessage),
+        new("Command", state.CommandStatus, state.CommandMessage),
+        new("SCPI", state.ScpiStatus, state.ScpiMessage)
+    ];
+
+    protected override void OnInitialized()
+    {
+        Runtime.Changed += OnRuntimeChanged;
+        Ownership.Changed += OnOwnershipChanged;
+        Refresh();
+    }
+
+    private void Refresh()
+    {
+        state = Runtime.Current;
+        claims = Ownership.Snapshot();
+    }
+
+    private void OnRuntimeChanged(RuntimeState updated)
+    {
+        state = updated;
+        claims = Ownership.Snapshot();
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    private void OnOwnershipChanged()
+    {
+        claims = Ownership.Snapshot();
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        Runtime.Changed -= OnRuntimeChanged;
+        Ownership.Changed -= OnOwnershipChanged;
+    }
+
+    private static string StatusBadgeClass(string? status) => status?.ToLowerInvariant() switch
+    {
+        "normal" or "good" or "ok" or "true" => "status-badge success",
+        "starting" or "pending" => "status-badge warning",
+        "degraded" or "bad" or "failed" or "owned_by_other" or "missing" or "missing_key" or "false" => "status-badge danger",
+        _ => "status-badge neutral"
+    };
+
+    private sealed record SubsystemRow(
+        string Name,
+        RuntimeSubsystemStatus Status,
+        string Message);
+}
