@@ -20,4 +20,11 @@
     <PackageReference Include="StackExchange.Redis" Version="2.12.14" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Ptlk.RedisScpi.Tests\**\*.cs" />
+    <Content Remove="Ptlk.RedisScpi.Tests\**\*" />
+    <EmbeddedResource Remove="Ptlk.RedisScpi.Tests\**\*" />
+    <None Remove="Ptlk.RedisScpi.Tests\**\*" />
+  </ItemGroup>
+
 </Project>
